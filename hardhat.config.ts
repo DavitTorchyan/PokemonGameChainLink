@@ -20,7 +20,7 @@ const config: HardhatUserConfig = {
     },
     goerli: {
       url: process.env.GOERLI_URL,
-      accounts: process.env.DEV_PRIVKEY ? [process.env.DEV_PRIVKEY]: [],
+      accounts: process.env.DEV_PRIVKEY ? [process.env.DEV_PRIVKEY, process.env.ANOTHER_PRIVKEY as string]: [],
     },
     mumbai: {
       url: process.env.MUMBAI_URL,

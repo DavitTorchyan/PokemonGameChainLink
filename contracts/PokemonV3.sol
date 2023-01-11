@@ -5,26 +5,34 @@ import "@openzeppelin/contracts/utils/Strings.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
-import "@chainlink/contracts/src/v0.8/VRFV2WrapperConsumerBase.sol";
+// import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+// import "@chainlink/contracts/src/v0.8/VRFV2WrapperConsumerBase.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
-import "hardhat/console.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 
-contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
+// import "@chainlink/contracts/src/v0.8/ConfirmedOwner.sol";
+
+// import "hardhat/console.sol";
+
+contract PokemonV3 is IERC721, Pausable, Ownable, VRFConsumerBaseV2 {
     string public name;
     string public symbol;
     uint256 public totalSupply; //totalSupply is also the id
     uint256 private randNonce;
 
-    uint64 s_subscriptionId = 8260;
+    uint64 s_subscriptionId;
     address vrfCoordinator = 0x2Ca8E0C643bDe4C2E08ab1fA0da3401AdAD7734D;
-    uint32 callbackGasLimit = 40000;
+    bytes32 keyHash =
+        0x79d3d8832d904592c0bf9818b621522c988bb8b0c05cdc3b15aea1b6e8db0c15;
+    uint32 callbackGasLimit = 500000;
     uint32 numWords = 1;
     uint16 requestConfirmations = 3;
     address constant linkAddress = 0x326C977E6efc84E512bB9C30f76E30c160eD06FB;
     address constant vrfWrapperAddress =
         0x708701a1DfF4f478de54383E49a627eD4852C816;
-    uint256 randomNumber;
+    uint256 public randomNumber;
+    VRFCoordinatorV2Interface COORDINATOR;
 
     using EnumerableSet for EnumerableSet.UintSet;
     EnumerableSet.UintSet private idSet;
@@ -55,6 +63,13 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
         uint256 legs;
     }
 
+    struct Battle {
+        address requester;
+        address accepter;
+        uint256 requesterPokId;
+        uint256 accepterPokId;
+    }
+
     event BattleStarted(
         address indexed opponent1,
         address indexed opponent2,
@@ -67,7 +82,9 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
         address indexed loser,
         uint256 winnerPokemonId,
         uint256 loserPokemonId,
-        uint256 endTime
+        uint256 endTime,
+        uint256 winnerProb,
+        uint256 loserProb
     );
 
     // tokenId => PokemonData
@@ -80,11 +97,16 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
         private allowances;
     // account => all owned pokemon ids
     mapping(address => EnumerableSet.UintSet) ownedPokemonId;
+    // random number requestId => battle
+    mapping(uint256 => Battle) public battles;
 
     constructor(
+        uint64 subscriptionId,
         string memory name_,
         string memory symbol_
-    ) VRFV2WrapperConsumerBase(linkAddress, vrfWrapperAddress) {
+    ) VRFConsumerBaseV2(vrfCoordinator) {
+        COORDINATOR = VRFCoordinatorV2Interface(vrfCoordinator);
+        s_subscriptionId = subscriptionId;
         name = name_;
         symbol = symbol_;
     }
@@ -93,7 +115,7 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
         return balances[_owner];
     }
 
-    function ownerOf(uint256 _tokenId) external view returns (address) {
+    function ownerOf(uint256 _tokenId) public view returns (address) {
         return ownerOfPokemon[_tokenId];
     }
 
@@ -264,8 +286,7 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
             "Strength lower than 100, your pokemon needs training!"
         );
         require(
-            pokemons[ownId].inABattle != true &&
-                pokemons[oppId].inABattle != true,
+            !pokemons[ownId].inABattle && !pokemons[oppId].inABattle,
             "Pokemons currently in a battle!"
         );
         if (
@@ -274,10 +295,10 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
             pendingBattles[oppId][ownId].requested = false;
         }
         require(
-            pendingBattles[oppId][ownId].requested == true,
+            pendingBattles[oppId][ownId].requested,
             "No such pending battle!"
         );
-        battle(ownId, oppId, ownerOfPokemon[oppId]);
+        requestRandomWords(ownerOf(oppId), msg.sender, oppId, ownId);
     }
 
     function rejectBattle(uint256 ownId, uint256 oppId) external whenNotPaused {
@@ -294,12 +315,32 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
         uint256[] memory randomWords
     ) internal override {
         randomNumber = randomWords[0];
+        address opponent = battles[requestId].requester;
+        uint256 ownId = battles[requestId].accepterPokId;
+        uint256 oppId = battles[requestId].requesterPokId;
+        battle(ownId, oppId, opponent);
     }
 
-    function getRandomNumber() private returns (uint256 requestId) {
-        return (
-            requestRandomness(callbackGasLimit, requestConfirmations, numWords)
+    function requestRandomWords(
+        address _requester,
+        address _accepter,
+        uint256 requesterId,
+        uint256 accepterId
+    ) internal returns (uint256 requestId) {
+        requestId = COORDINATOR.requestRandomWords(
+            keyHash,
+            s_subscriptionId,
+            requestConfirmations,
+            callbackGasLimit,
+            numWords
         );
+        battles[requestId] = Battle({
+            requester: _requester,
+            accepter: _accepter,
+            requesterPokId: requesterId,
+            accepterPokId: accepterId
+        });
+        return requestId;
     }
 
     function battle(
@@ -317,7 +358,6 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
             "Pokemons still in cooldown!"
         );
 
-        getRandomNumber();
         PokemonData storage pokemon1 = pokemons[oppId];
         PokemonData storage pokemon2 = pokemons[ownId];
         pokemon1.lastBattleTime = block.timestamp;
@@ -329,7 +369,7 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
         uint256 pokemon1WinProb = (pokemon1.strength * 100) / combinedStrength;
         uint256 pokemon2WinProb = 100 - pokemon1WinProb;
         randNonce++;
-        uint256 winningNumber = randomNumber % (100 + 1);
+        uint256 winningNumber = (randomNumber % 100) + 1;
 
         if (winningNumber <= pokemon1WinProb) {
             pokemon1.totalWins += 1;
@@ -341,10 +381,12 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
             pokemon2.strength -= pokemon2WinProb / 2;
             emit BattleEnded(
                 opponent,
-                msg.sender,
+                ownerOf(ownId),
                 oppId,
                 ownId,
-                block.timestamp
+                block.timestamp,
+                pokemon1WinProb,
+                pokemon2WinProb
             );
         } else {
             pokemon2.totalWins += 1;
@@ -355,11 +397,13 @@ contract PokemonV3 is IERC721, Pausable, Ownable, VRFV2WrapperConsumerBase {
             pokemon1.totalLosses += 1;
             pokemon1.strength -= pokemon1WinProb / 2;
             emit BattleEnded(
-                msg.sender,
+                ownerOf(ownId),
                 opponent,
                 ownId,
                 oppId,
-                block.timestamp
+                block.timestamp,
+                pokemon2WinProb,
+                pokemon1WinProb
             );
         }
 
